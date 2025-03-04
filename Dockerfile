@@ -37,7 +37,7 @@ WORKDIR /$appname
 # this will make sure than the dependencies is cached
 COPY poetry.lock pyproject.toml /$appname/
 RUN poetry config virtualenvs.create false \
-    && poetry install -vv --no-root --no-interaction \
+    && poetry install -vv --no-root --without dev --no-interaction \
     && poetry show -v
 
 # copy source code ONLY after installing dependencies
@@ -48,7 +48,7 @@ COPY clear_prometheus_multiproc /$appname/clear_prometheus_multiproc
 
 # install fence
 RUN poetry config virtualenvs.create false \
-    && poetry install -vv --no-root --no-interaction \
+    && poetry install -vv --without dev --no-interaction \
     && poetry show -v
 
 RUN echo "COMMIT=\"${COMMIT_HASH}\"" >$appname/version_data.py \
