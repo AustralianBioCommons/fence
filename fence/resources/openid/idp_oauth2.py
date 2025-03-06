@@ -125,6 +125,8 @@ class Oauth2ClientBase(object):
         verify_aud = self.settings.get("verify_aud", False)
         audience = self.settings.get("audience", self.settings.get("client_id"))
 
+        self.logger.info(token)
+
         try:
             decoded_access_token = validate_jwt(
                 encoded_token=token["access_token"],
