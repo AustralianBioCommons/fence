@@ -4,7 +4,7 @@
 # To check running container do: docker exec -it CONTAINER bash
 
 ARG AZLINUX_BASE_VERSION=master
-
+ARG COMMIT_HASH
 # ------ Base stage ------
 FROM quay.io/cdis/python-nginx-al:${AZLINUX_BASE_VERSION} AS base
 
@@ -34,8 +34,7 @@ RUN poetry lock -vv --no-update \
     && poetry install -vv --only main --no-interaction
 
 # Setup version info
-RUN git config --global --add safe.directory /${appname} && COMMIT=`git rev-parse HEAD` && echo "COMMIT=\"${COMMIT}\"" > /$appname/version_data.py \
-    && VERSION=`git describe --always --tags` && echo "VERSION=\"${VERSION}\"" >> /$appname/version_data.py
+RUN echo "COMMIT=\"$COMMIT_HASH\"" > /fence/version_data.py
 
 
 
