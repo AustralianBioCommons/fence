@@ -225,9 +225,13 @@ class Oauth2ClientBase(object):
         try:
             token_endpoint = self.get_value_from_discovery_doc("token_endpoint", "")
             jwks_endpoint = self.get_value_from_discovery_doc("jwks_uri", "")
+            self.logger.debug(f"Received code: {code}")
+            token = self.get_token(token_endpoint, code)
+            self.logger.debug(f"Token response: {token}")
             claims, refresh_token, access_token = self.get_jwt_claims_identity(
                 token_endpoint, jwks_endpoint, code
             )
+            self.logger.debug(f"Decoded claims: {claims}")
 
             groups = None
             group_prefix = None
@@ -330,6 +334,11 @@ class Oauth2ClientBase(object):
             expires_at = token_response.get(
                 "expires_at", time.time() + default_refresh_token_exp
             )
+            self.logger.debug(
+                f"Checking refresh token {refresh_token} expiring at {expires}"
+            )
+            self.logger.debug(f"Refreshing token with token_endpoint: {token_endpoint}")
+            self.logger.debug(f"Refresh token response: {token_response}")
 
             self.store_refresh_token(
                 user,
@@ -506,6 +515,10 @@ class Oauth2ClientBase(object):
             authz_groups_from_idp = self.get_groups_from_token(
                 decoded_access_token, group_prefix
             )
+            self.logger.debug("Starting update_user_authorization")
+            self.logger.debug(f"Token before decode: {token}")
+            self.logger.debug(f"Decoded access token: {decoded_access_token}")
+            self.logger.debug(f"Groups from IdP: {authz_groups_from_idp}")
 
             # if group name is in the list from arborist:
             if authz_groups_from_idp:
