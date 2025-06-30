@@ -205,8 +205,7 @@ class DefaultOAuth2Callback(Resource):
         refresh token using three methods:
 
         1. Using PyJWT to decode the token (without signature verification).
-        2. Introspecting the token (if supported by the identity provider).
-        3. Manually base64 decoding the token's payload (if it's a JWT).
+        2. Manually base64 decoding the token's payload (if it's a JWT).
 
         **Disclaimer:** This function assumes that the refresh token is valid and
         does not perform any JWT validation. For JWTs from an OpenID Connect (OIDC)
@@ -257,7 +256,7 @@ class DefaultOAuth2Callback(Resource):
             if exp is not None:
                 return exp
         except Exception as e:
-            logger.info(f"Method 3 (Manual decoding) failed: {e}")
+            logger.info(f"Method 2 (Manual decoding) failed: {e}")
 
         # If all methods fail, return None
         return None
@@ -268,7 +267,7 @@ class DefaultOAuth2Callback(Resource):
         metrics.add_login_event(
             user_sub=flask.g.user.id,
             idp=self.idp_name,
-            fence_idp=flask.session.get("fence_idp"),
+            upstream_idp=flask.session.get("upstream_idp"),
             shib_idp=flask.session.get("shib_idp"),
             client_id=flask.session.get("client_id"),
         )
@@ -301,7 +300,7 @@ def prepare_login_log(idp_name):
         "username": flask.g.user.username,
         "sub": flask.g.user.id,
         "idp": idp_name,
-        "fence_idp": flask.session.get("fence_idp"),
+        "upstream_idp": flask.session.get("upstream_idp"),
         "shib_idp": flask.session.get("shib_idp"),
         "client_id": flask.session.get("client_id"),
     }
