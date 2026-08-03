@@ -19,7 +19,7 @@ from gen3authz.client.arborist.client import ArboristClient
 
 from fence.config import config
 from fence.resources.openid.ras_oauth2 import RASOauth2Client
-from fence.auth import login_user
+from fence.auth import login_user_or_require_registration
 from fence.sync.sync_users import UserSyncer
 from fence.resources import userdatamodel as udm
 from fence.models import (
@@ -31,7 +31,7 @@ from fence.models import (
     User,
 )
 
-from tests.conftest import random_txn
+from tests.conftest import random_txn, NoAsyncMagicMock
 
 logger = get_logger(__name__)
 
@@ -154,7 +154,7 @@ def syncer(db_session, request, rsa_private_key, kid):
         sync_from_local_csv_dir=LOCAL_CSV_DIR,
         sync_from_local_yaml_file=LOCAL_YAML_DIR,
     )
-    syncer_obj.arborist_client = MagicMock(ArboristClient)
+    syncer_obj.arborist_client = NoAsyncMagicMock(ArboristClient)
 
     def mocked_update(parent_path, resource, **kwargs):
         resource["tag"] = "123456"
@@ -362,6 +362,9 @@ def fake_ras_login(username, subject, email=None, db_session=None):
     logger.debug(
         f"subject: {subject}, username: {username}, actual_username: {actual_username}"
     )
-    login_user(actual_username, provider="ras", email=None, id_from_idp=subject)
+    is_logged_in = login_user_or_require_registration(
+        actual_username, provider="ras", email=None, id_from_idp=subject
+    )
+    assert is_logged_in
 
     # todo sub to iss table

@@ -1,5 +1,8 @@
+import paramiko.ssh_exception
 import backoff
 import glob
+
+import httpx
 import jwt
 import os
 import re
@@ -20,7 +23,7 @@ from stat import S_ISDIR
 import paramiko
 from cdislogging import get_logger
 from email_validator import validate_email, EmailNotValidError
-from gen3authz.client.arborist.errors import ArboristError
+from gen3authz.client.arborist.errors import ArboristError, ArboristTimeoutError
 from gen3users.validation import validate_user_yaml
 from paramiko.proxy import ProxyCommand
 from sqlalchemy.exc import IntegrityError
@@ -402,13 +405,30 @@ class UserSyncer(object):
         with paramiko.SSHClient() as client:
             client.set_log_channel(self.logger.name)
 
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            # Patch paramiko to use sha256 instead of md5 for enhanced security and fips compliance
+            paramiko.PKey.get_fingerprint = lambda self: hashlib.sha256(
+                self.asbytes()
+            ).digest()
+
+            # Load known host keys
+            known_hosts_path = os.path.expanduser("~/.ssh/known_hosts")
+            if os.path.exists(known_hosts_path):
+                client.load_host_keys(known_hosts_path)
+            else:
+                self.logger.error(
+                    "No known_hosts file found — rejecting unknown hosts - make sure the SFTP host key is present in known_hosts before attempting connection."
+                )
+
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
             parameters = {
                 "hostname": str(server.get("host", "")),
                 "username": str(server.get("username", "")),
-                "password": str(server.get("password", "")),
                 "port": int(server.get("port", 22)),
             }
+            if server.get("private_key_filename"):
+                parameters["key_filename"] = str(server.get("private_key_filename"))
+            else:
+                parameters["password"] = str(server.get("password", ""))
             if proxy:
                 parameters["sock"] = proxy
 
@@ -418,9 +438,13 @@ class UserSyncer(object):
                     parameters.get("port", "unknown"),
                 )
             )
-            self._connect_with_ssh(ssh_client=client, parameters=parameters)
-            with client.open_sftp() as sftp:
-                download_dir(sftp, "./", path)
+            try:
+                self._connect_with_ssh(ssh_client=client, parameters=parameters)
+
+                with client.open_sftp() as sftp:
+                    download_dir(sftp, "./", path)
+            except paramiko.ssh_exception.SSHException as e:
+                self.logger.error(f"SSH connection failed, error: {e}")
 
         if proxy:
             proxy.close()
@@ -1269,6 +1293,7 @@ class UserSyncer(object):
         """
         initialize projects
         """
+
         if self.project_mapping:
             for projects in list(self.project_mapping.values()):
                 for p in projects:
@@ -1509,6 +1534,15 @@ class UserSyncer(object):
 
                     dbgap_project += "." + consent_code
 
+                self._add_children_for_dbgap_project(
+                    dbgap_project,
+                    privileges,
+                    username,
+                    sess,
+                    user_projects_to_modify,
+                    dbgap_config,
+                )
+
                 self._process_dbgap_project(
                     dbgap_project,
                     privileges,
@@ -1520,12 +1554,19 @@ class UserSyncer(object):
         for user in user_projects_to_modify.keys():
             user_projects[user] = user_projects_to_modify[user]
 
-    def sync(self):
+    def sync(self, prune_users=True):
+        """Run a full user synchronization.
+
+        Args:
+            prune_users (bool): whether users with no remaining non-generic
+                policies may be deleted from Arborist during user.yaml
+                reconciliation. Defaults to ``True`` for backward compatibility.
+        """
         if self.session:
-            self._sync(self.session)
+            self._sync(self.session, prune_users=prune_users)
         else:
             with self.driver.session as s:
-                self._sync(s)
+                self._sync(s, prune_users=prune_users)
 
     def download(self):
         for dbgap_server in self.dbGaP:
@@ -1556,12 +1597,11 @@ class UserSyncer(object):
             self.logger.error(e)
             raise
 
-    def _sync(self, sess):
+    def _sync(self, sess, prune_users=True):
         """
         Collect files from dbgap server(s), sync csv and yaml files to storage
         backend and fence DB
         """
-
         # get all dbgap files
         user_projects = {}
         user_info = {}
@@ -1652,7 +1692,7 @@ class UserSyncer(object):
                     " arborist client--did you run sync with --arborist <arborist client> arg?"
                 )
             self.logger.info("Synchronizing arborist...")
-            success = self._update_arborist(sess, user_yaml)
+            success = self._update_arborist(user_yaml)
             if success:
                 self.logger.info("Finished synchronizing arborist")
             else:
@@ -1664,7 +1704,12 @@ class UserSyncer(object):
         # update the Arborist DB (user access)
         if self.arborist_client:
             self.logger.info("Synchronizing arborist with authorization info...")
-            success = self._update_authz_in_arborist(sess, user_projects, user_yaml)
+            success = self._update_authz_in_arborist(
+                sess,
+                user_projects,
+                user_yaml,
+                prune_users=prune_users,
+            )
             if success:
                 self.logger.info(
                     "Finished synchronizing authorization info to arborist"
@@ -1743,7 +1788,7 @@ class UserSyncer(object):
                             {phsid_with_consent: {"read-storage", "read"}}
                         )
 
-    def _update_arborist(self, session, user_yaml):
+    def _update_arborist(self, user_yaml):
         """
         Create roles, resources, policies, groups in arborist from the information in
         ``user_yaml``.
@@ -1780,7 +1825,7 @@ class UserSyncer(object):
         self.logger.debug("dbgap resource paths: {}".format(dbgap_resource_paths))
 
         combined_resources = utils.combine_provided_and_dbgap_resources(
-            resources, dbgap_resource_paths
+            resources, dbgap_resource_paths, self.logger
         )
 
         for resource in combined_resources:
@@ -1791,7 +1836,7 @@ class UserSyncer(object):
                 self.arborist_client.update_resource("/", resource, merge=True)
             except ArboristError as e:
                 self.logger.error(e)
-                # keep going; maybe just some conflicts from things existing already
+                raise
 
         # update roles
         roles = user_yaml.authz.get("roles", [])
@@ -1810,7 +1855,7 @@ class UserSyncer(object):
                         self._created_roles.add(role["id"])
                 except ArboristError as e:
                     self.logger.error(e)
-                    # keep going; maybe just some conflicts from things existing already
+                    raise
 
         # update policies
         policies = user_yaml.authz.get("policies", [])
@@ -1818,14 +1863,14 @@ class UserSyncer(object):
             policy_id = policy.pop("id")
             try:
                 self.logger.debug(
-                    "Trying to upsert policy with id {}".format(policy_id)
+                    "Trying to upsert policy with id {}: {}".format(policy_id, policy)
                 )
                 response = self.arborist_client.update_policy(
                     policy_id, policy, create_if_not_exist=True
                 )
             except ArboristError as e:
                 self.logger.error(e)
-                # keep going; maybe just some conflicts from things existing already
+                raise
             else:
                 if response:
                     self.logger.debug("Upserted policy with id {}".format(policy_id))
@@ -1883,35 +1928,122 @@ class UserSyncer(object):
 
         return True
 
-    def _revoke_all_policies_preserve_mfa(self, username, idp=None):
+    def _grant_arborist_policies(
+        self,
+        username,
+        incoming_policies,
+        user_yaml,
+        expires=None,
+        remove_users_with_no_policies=True,
+    ):
         """
-        If MFA is enabled for the user's idp, check if they have the /multifactor_auth resource and restore the
-        mfa_policy after revoking all policies.
+        Find the difference between the existing policies for a user and the incoming policies,
+        and decide whether to add, remove, or keep policies.
+
+        Args:
+            username (str): the username of the user
+            incoming_policies (set): set of policies to be applied to the user
+            user_yaml (UserYAML): UserYAML object containing authz information
+            expires (int): time at which authz info in Arborist should expire
+            remove_users_with_no_policies (bool): whether to delete users with no access from
+                the Arborist database
         """
+        user_existing_policies = set()
+        to_add = set()
+        to_remove = set()
+        is_revoke_all = False
 
-        is_mfa_enabled = "multifactor_auth_claim_info" in config["OPENID_CONNECT"].get(
-            idp, {}
-        )
-
-        if not is_mfa_enabled:
-            # TODO This should be a diff, not a revocation of all policies.
-            self.arborist_client.revoke_all_policies_for_user(username)
-            return
-
-        policies = []
         try:
-            user_data_from_arborist = self.arborist_client.get_user(username)
-            policies = user_data_from_arborist["policies"]
-        except Exception as e:
-            self.logger.error(
-                f"Could not retrieve user's policies, revoking all policies anyway. {e}"
+            user_existing_policies = set(
+                policy["policy"]
+                for policy in self.arborist_client.get_user(username)["policies"]
             )
-        finally:
-            # TODO This should be a diff, not a revocation of all policies.
-            self.arborist_client.revoke_all_policies_for_user(username)
+            self.logger.info(
+                f"Fetched user {username} existing policies: {user_existing_policies}"
+            )
+        except ArboristError as e:
+            self.logger.error(
+                f"Could not get user {username} policies from Arborist: {e}. Revoking all policies..."
+            )
+            # if getting existing policies fails, revoke all policies and re-apply
+            is_revoke_all = True
 
-        if "mfa_policy" in policies:
-            self.arborist_client.grant_user_policy(username, "mfa_policy")
+        if user_yaml:
+            anonymous_policies = set(
+                user_yaml.authz.get("anonymous_policies", [])
+                + user_yaml.authz.get("all_users_policies", [])
+            )
+            user_existing_policies = user_existing_policies - anonymous_policies
+
+        if is_revoke_all is False and len(incoming_policies) > 0:
+            to_add = incoming_policies - user_existing_policies
+            to_remove = user_existing_policies - incoming_policies
+        else:
+            # if incoming_policies is empty, we revoke all policies
+            is_revoke_all = True
+
+        if not is_revoke_all:
+            success = not to_remove
+            try:
+                if to_remove:
+                    for policy in to_remove:
+                        self.logger.info(
+                            f"Revoking policy {policy} for user {username}."
+                        )
+                        success = self.arborist_client.revoke_user_policy(
+                            username, policy
+                        )
+            except ArboristError as e:
+                self.logger.error(
+                    f"Could not revoke user {username} policy {policy}: {e}"
+                )
+            if not success:
+                # `revoke_user_policy` returns None in case of error
+                self.logger.error(
+                    f"Could not revoke user {username} policy. Revoking all instead."
+                )
+                is_revoke_all = True
+
+        if is_revoke_all:
+            if (
+                remove_users_with_no_policies
+                and not incoming_policies
+                and not user_existing_policies
+            ):
+                # user without any access (other than anonymous and logged-in groups).
+                # cleanup: remove from the arborist DB so we do not check their access again every
+                # time this code runs.
+                self.logger.info(
+                    f"Deleting user {username} from Arborist (since they have no policies)."
+                )
+                self.arborist_client.delete_user(username)
+                return
+            success = False
+            try:
+                # Note: If a user only has group policies, we call `revoke_all_policies_for_user`
+                # for nothing. Could be fixed by adding a flag to the arborist "get user" endpoint
+                # to get the list of policies _excluding_ group policies, or by manually checking
+                # which policies are group policies (not worth it atm).
+                self.logger.info(f"Revoking all policies for user {username}.")
+                success = self.arborist_client.revoke_all_policies_for_user(username)
+            except ArboristError as e:
+                self.logger.error(
+                    f"Could not revoke all policies for user {username}. Error: {e}"
+                )
+            if not success:
+                # `revoke_all_policies_for_user` returns None in case of error
+                raise Exception(f"Could not revoke all policies for user {username}")
+            to_add = incoming_policies  # if we revoke all, we need to add all incoming policies
+
+        if (
+            "mfa_policy" not in incoming_policies
+            and "mfa_policy" in user_existing_policies
+        ):
+            to_add.add("mfa_policy")
+
+        if to_add:
+            self.logger.info(f"Bulk granting user {username} policies {to_add}.")
+            self._grant_bulk_user_policies(username, to_add, expires)
 
     def _update_authz_in_arborist(
         self,
@@ -1920,6 +2052,7 @@ class UserSyncer(object):
         user_yaml=None,
         single_user_sync=False,
         expires=None,
+        prune_users=True,
     ):
         """
         Assign users policies in arborist from the information in
@@ -1958,8 +2091,10 @@ class UserSyncer(object):
 
         # get list of users from arborist to make sure users that are completely removed
         # from authorization sources get policies revoked
+
         arborist_user_projects = {}
         if not single_user_sync:
+
             try:
                 arborist_users = self.arborist_client.get_users().json["users"]
 
@@ -1981,9 +2116,6 @@ class UserSyncer(object):
 
             # update the project info with users from arborist
             self.sync_two_phsids_dict(arborist_user_projects, user_projects)
-
-        policy_id_list = []
-        policies = []
 
         # prefer in-memory if available from user_yaml, if not, get from database
         if user_yaml and user_yaml.project_to_resource:
@@ -2019,8 +2151,6 @@ class UserSyncer(object):
                 idp = user.identity_provider.name if user.identity_provider else None
 
             self.arborist_client.create_user_if_not_exist(username)
-            if not single_user_sync:
-                self._revoke_all_policies_preserve_mfa(username, idp)
 
             # as of 2/11/2022, for single_user_sync, as RAS visa parsing has
             # previously mapped each project to the same set of privileges
@@ -2030,10 +2160,11 @@ class UserSyncer(object):
             unique_policies = self._determine_unique_policies(
                 user_project_info, project_to_authz_mapping
             )
-
             for roles in unique_policies.keys():
                 for role in roles:
                     self._create_arborist_role(role)
+
+            incoming_policies = set()  # set of policies for current user.
 
             if single_user_sync:
                 for ordered_roles, ordered_resources in unique_policies.items():
@@ -2053,6 +2184,7 @@ class UserSyncer(object):
                         username, policy_hash, expires=expires
                     )
             else:
+                policy_ids_to_grant = set()
                 for roles, resources in unique_policies.items():
                     for role in roles:
                         for resource in resources:
@@ -2062,15 +2194,18 @@ class UserSyncer(object):
                             # format project '/x/y/z' -> 'x.y.z'
                             # so the policy id will be something like 'x.y.z-create'
                             policy_id = _format_policy_id(resource, role)
+                            incoming_policies.add(policy_id)
                             if policy_id not in self._created_policies:
                                 try:
+                                    policy = {
+                                        "description": "policy created by fence sync",
+                                        "role_ids": [role],
+                                        "resource_paths": [resource],
+                                    }
+                                    self.logger.info(f"Updating policy: {policy}")
                                     self.arborist_client.update_policy(
                                         policy_id,
-                                        {
-                                            "description": "policy created by fence sync",
-                                            "role_ids": [role],
-                                            "resource_paths": [resource],
-                                        },
+                                        policy,
                                         create_if_not_exist=True,
                                     )
                                 except ArboristError as e:
@@ -2080,18 +2215,28 @@ class UserSyncer(object):
                                         )
                                     )
                                 self._created_policies.add(policy_id)
-
-                            self._grant_arborist_policy(
-                                username, policy_id, expires=expires
-                            )
+                            policy_ids_to_grant.add(policy_id)
+                self._grant_arborist_policies(
+                    username,
+                    policy_ids_to_grant,
+                    user_yaml=None,
+                    expires=expires,
+                    remove_users_with_no_policies=False,
+                )
 
             if user_yaml:
-                for policy in user_yaml.policies.get(username, []):
-                    self.arborist_client.grant_user_policy(
-                        username,
-                        policy,
-                        expires_at=expires,
-                    )
+                user_yaml_policies = set(user_yaml.policies.get(username, []))
+                incoming_policies = (
+                    incoming_policies | user_yaml_policies
+                )  # add policies from whitelist and useryaml
+
+            self._grant_arborist_policies(
+                username,
+                incoming_policies,
+                user_yaml,
+                expires=expires,
+                remove_users_with_no_policies=prune_users,
+            )
 
         if user_yaml:
             for client_name, client_details in user_yaml.clients.items():
@@ -2244,11 +2389,11 @@ class UserSyncer(object):
         TODO for the sake of simplicity, it would be nice if only one network
         request was made no matter the input.
         """
-        for request_body in utils.combine_provided_and_dbgap_resources({}, resources):
+        for request_body in utils.combine_provided_and_dbgap_resources(
+            {}, resources, self.logger
+        ):
             try:
-                response_json = self.arborist_client.update_resource(
-                    "/", request_body, merge=True
-                )
+                self.arborist_client.update_resource("/", request_body, merge=True)
             except ArboristError as e:
                 self.logger.error(
                     "could not create Arborist resources using request body `{}`. error: {}".format(
@@ -2279,12 +2424,14 @@ class UserSyncer(object):
             bool: True if policy creation was successful. False otherwise
         """
         try:
+            policy = {
+                "id": policy_id,
+                "role_ids": roles,
+                "resource_paths": resources,
+            }
+            self.logger.info(f"Creating policy: {policy}")
             response_json = self.arborist_client.create_policy(
-                {
-                    "id": policy_id,
-                    "role_ids": roles,
-                    "resource_paths": resources,
-                },
+                policy,
                 skip_if_exists=skip_if_exists,
             )
         except ArboristError as e:
@@ -2312,7 +2459,7 @@ class UserSyncer(object):
         """
 
         def escape(s):
-            return s.replace(",", "\,")
+            return s.replace(",", "\\,")
 
         canonical_roles = ",".join(escape(r) for r in ordered_roles)
         canonical_resources = ",".join(escape(r) for r in ordered_resources)
@@ -2335,11 +2482,18 @@ class UserSyncer(object):
             bool: True if granting of policy was successful, False otherwise
         """
         try:
-            response_json = self.arborist_client.grant_user_policy(
+            resp = self.arborist_client.grant_user_policy(
                 username,
                 policy_id,
                 expires_at=expires,
             )
+            if not resp:
+                self.logger.error(
+                    "could not grant policy `{}` to user `{}`".format(
+                        policy_id, username
+                    )
+                )
+                return False
         except ArboristError as e:
             self.logger.error(
                 "could not grant policy `{}` to user `{}`: {}".format(
@@ -2351,6 +2505,41 @@ class UserSyncer(object):
         self.logger.debug(
             "granted policy `{}` to user `{}`".format(policy_id, username)
         )
+        return True
+
+    def _grant_bulk_user_policies(self, username, policy_ids, expires=None):
+        """
+        Wrapper around gen3authz's grant_user_policies with additional logging
+
+        Args:
+            username (str): username of user in Arborist who policy should be
+                            granted to
+            policy_ids (set[str]): Arborist policy ids
+
+        Return:
+            bool: True if granting of policies was successful, False otherwise
+        """
+        try:
+            resp = self.arborist_client.grant_bulk_user_policy(
+                username, policy_ids, expires
+            )
+            if not resp:
+                self.logger.error(
+                    "could not grant bulk policies to user `{}`".format(username)
+                )
+                return False
+        except ArboristError as e:
+            self.logger.error(
+                "could not grant bulk policies to user `{}`: {}".format(username, e)
+            )
+            return False
+        except ArboristTimeoutError as e:
+            self.logger.error(
+                f"Timeout waiting for response to grant bulk policies  to user `{username}`: {e}"
+                "This user will be skipped and usersync will continue."
+                "As long as the timeout is not a pool/connection timeout, then "
+            )
+            return False
         return True
 
     def _determine_arborist_resource(self, dbgap_study, dbgap_config):

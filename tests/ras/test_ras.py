@@ -25,7 +25,7 @@ from fence.errors import InternalError
 
 from tests.utils import add_test_ras_user, TEST_RAS_USERNAME, TEST_RAS_SUB
 from tests.dbgap_sync.conftest import add_visa_manually
-from fence.job.visa_update_cronjob import Visa_Token_Update
+from fence.job.access_token_updater import TokenAndAuthUpdater
 import tests.utils
 from tests.conftest import get_subjects_to_passports
 
@@ -95,6 +95,7 @@ def test_update_visa_token(
     """
     Test to check visa table is updated when getting new visa
     """
+
     # ensure we don't actually try to reach out to external sites to refresh public keys
     def validate_jwt_no_key_refresh(*args, **kwargs):
         kwargs.update({"attempt_refresh": False})
@@ -713,7 +714,7 @@ def test_visa_update_cronjob(
     mock_userinfo.side_effect = _get_userinfo
 
     # test "fence-create update-visa"
-    job = Visa_Token_Update()
+    job = TokenAndAuthUpdater()
     job.pkey_cache = {
         "https://stsstg.nih.gov": {
             kid: rsa_public_key,
@@ -765,7 +766,7 @@ def test_map_iss_sub_pair_to_user_with_no_prior_DRS_access(db_session):
     )
 
     assert username_to_log_in == username
-    iss_sub_pair_to_user = db_session.query(IssSubPairToUser).get((iss, sub))
+    iss_sub_pair_to_user = db_session.get(IssSubPairToUser, (iss, sub))
     assert iss_sub_pair_to_user.user.username == username
     assert iss_sub_pair_to_user.user.email == email
     iss_sub_pair_to_user_records = db_session.query(IssSubPairToUser).all()
@@ -803,7 +804,7 @@ def test_map_iss_sub_pair_to_user_with_prior_DRS_access(
     get_or_create_gen3_user_from_iss_sub(iss, sub, db_session=db_session)
     iss_sub_pair_to_user_records = db_session.query(IssSubPairToUser).all()
     assert len(iss_sub_pair_to_user_records) == 1
-    iss_sub_pair_to_user = db_session.query(IssSubPairToUser).get((iss, sub))
+    iss_sub_pair_to_user = db_session.get(IssSubPairToUser, (iss, sub))
     assert iss_sub_pair_to_user.user.username == "123_abcdomain.tld"
 
     username_to_log_in = ras_client.map_iss_sub_pair_to_user(
@@ -813,7 +814,7 @@ def test_map_iss_sub_pair_to_user_with_prior_DRS_access(
     assert username_to_log_in == username
     iss_sub_pair_to_user_records = db_session.query(IssSubPairToUser).all()
     assert len(iss_sub_pair_to_user_records) == 1
-    iss_sub_pair_to_user = db_session.query(IssSubPairToUser).get((iss, sub))
+    iss_sub_pair_to_user = db_session.get(IssSubPairToUser, (iss, sub))
     assert iss_sub_pair_to_user.user.username == username
     assert iss_sub_pair_to_user.user.email == email
 
@@ -884,5 +885,5 @@ def test_map_iss_sub_pair_to_user_with_prior_login_and_prior_DRS_access(
         iss, sub, username, email, db_session=db_session
     )
     assert username_to_log_in == "123_abcdomain.tld"
-    iss_sub_pair_to_user = db_session.query(IssSubPairToUser).get((iss, sub))
+    iss_sub_pair_to_user = db_session.get(IssSubPairToUser, (iss, sub))
     assert iss_sub_pair_to_user.user.username == "123_abcdomain.tld"

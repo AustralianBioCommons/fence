@@ -1,6 +1,7 @@
 """
 Test fence.blueprints.data.indexd.IndexedFile
 """
+
 import json
 from unittest import mock
 from mock import patch, MagicMock
@@ -397,6 +398,65 @@ def test_get_signed_url_s3_bucket_name(mock_get_value, s3_indexed_file_location,
                 assert "validbucketname-alreadyvalid" in result_url
 
 
+@patch("fence.blueprints.data.indexd.get_value")
+def test_explicit_over_regex(mock_get_value, app):
+    """
+    Test that an explicit bucket name is preferred over a regex pattern
+    """
+    s3_file_location = S3IndexedFileLocation(
+        url="s3://foo-bar-datacommons/some_folder/somefile.txt"
+    )
+    mock_get_value.side_effect = lambda config, key, error: {
+        "S3_BUCKETS": {
+            "foo-bar-.*": {
+                "cred": "fence-bot",
+                "region": "us-east-1",
+            },
+            "foo-bar-datacommons": {
+                "cred": "fence-bot",
+                "role-arn": "arn:aws:iam::12345:role/foobar",
+                "region": "us-east-1",
+            },
+        },
+        "AWS_CREDENTIALS": {
+            "fence-bot": {
+                "aws_access_key_id": "key",
+                "aws_secret_access_key": "secret",
+            }
+        },
+    }.get(key, error)
+
+    assert s3_file_location.bucket_name() == "foo-bar-datacommons"
+
+
+@patch("fence.blueprints.data.indexd.get_value")
+def test_regex_match_when_no_explicit(mock_get_value, app):
+    """
+    Test that a regex pattern is used when no explicit bucket exists
+    """
+    s3_file_location = S3IndexedFileLocation(
+        url="s3://foo-bar-xyz/some_folder/somefile.txt"
+    )
+    mock_get_value.side_effect = lambda config, key, error: {
+        "S3_BUCKETS": {
+            "foo-bar-.*": {
+                "cred": "fence-bot",
+                "region": "us-east-1",
+            },
+            "fizz-buzz-datacommons": {
+                "cred": "fence-bot",
+                "role-arn": "arn:aws:iam::12345:role/fizzbuzz",
+                "region": "us-east-1",
+            },
+        },
+        "AWS_CREDENTIALS": {
+            "fence-bot": {"aws_access_key_id": "key", "aws_secret_access_key": "secret"}
+        },
+    }.get(key, error)
+
+    assert s3_file_location.bucket_name() == "foo-bar-.*"
+
+
 @pytest.mark.parametrize("supported_action", ["download"], indirect=True)
 def test_internal_get_signed_url_no_location_match(
     app, supported_action, supported_protocol, indexd_client_accepting_record
@@ -687,38 +747,37 @@ def test_delete_files_unable_to_get_file_name(app, public_bucket_indexd_client):
             """
             raise Exception("url not available")
 
-    with patch("fence.blueprints.data.indexd.flask.current_app", return_value=app):
+    with patch(
+        "fence.blueprints.data.indexd.S3IndexedFileLocation.file_name",
+        side_effect=Exception("url not available"),
+    ):
         with patch(
-            "fence.blueprints.data.indexd.S3IndexedFileLocation.file_name",
+            "fence.blueprints.data.indexd.GoogleStorageIndexedFileLocation.file_name",
             side_effect=Exception("url not available"),
         ):
             with patch(
-                "fence.blueprints.data.indexd.GoogleStorageIndexedFileLocation.file_name",
+                "fence.blueprints.data.indexd.AzureBlobStorageIndexedFileLocation.file_name",
                 side_effect=Exception("url not available"),
             ):
                 with patch(
-                    "fence.blueprints.data.indexd.AzureBlobStorageIndexedFileLocation.file_name",
-                    side_effect=Exception("url not available"),
+                    "fence.resources.user.user_session.UserSession.create_initial_token"
                 ):
                     with patch(
-                        "fence.resources.user.user_session.UserSession.create_initial_token"
+                        "fence.blueprints.data.indexd.flask.current_app.boto.delete_data_file",
+                        side_effect=Exception("url not available"),
                     ):
                         with patch(
-                            "fence.blueprints.data.indexd.flask.current_app.boto.delete_data_file",
+                            "gen3cirrus.GoogleCloudManager.delete_data_file",
                             side_effect=Exception("url not available"),
                         ):
                             with patch(
-                                "gen3cirrus.GoogleCloudManager.delete_data_file",
-                                side_effect=Exception("url not available"),
+                                "fence.blueprints.data.indexd.BlobServiceClient.from_connection_string",
+                                return_value=MockBlobServiceClient(
+                                    conn_str="some_connection_string"
+                                ),
                             ):
-                                with patch(
-                                    "fence.blueprints.data.indexd.BlobServiceClient.from_connection_string",
-                                    return_value=MockBlobServiceClient(
-                                        conn_str="some_connection_string"
-                                    ),
-                                ):
-                                    indexed_file = IndexedFile(file_id="some id")
-                                    assert indexed_file.delete_files()
+                                indexed_file = IndexedFile(file_id="some id")
+                                assert indexed_file.delete_files()
 
 
 @pytest.mark.parametrize(
@@ -766,26 +825,23 @@ def test_delete_files_successful(app, public_bucket_indexd_client):
             """
             return
 
-    with patch("fence.blueprints.data.indexd.flask.current_app", return_value=app):
+    with patch("fence.resources.user.user_session.UserSession.create_initial_token"):
         with patch(
-            "fence.resources.user.user_session.UserSession.create_initial_token"
+            "fence.blueprints.data.indexd.flask.current_app.boto.delete_data_file",
+            return_value=("", 204),
         ):
             with patch(
-                "fence.blueprints.data.indexd.flask.current_app.boto.delete_data_file",
+                "gen3cirrus.GoogleCloudManager.delete_data_file",
                 return_value=("", 204),
             ):
                 with patch(
-                    "gen3cirrus.GoogleCloudManager.delete_data_file",
-                    return_value=("", 204),
+                    "fence.blueprints.data.indexd.BlobServiceClient.from_connection_string",
+                    return_value=MockBlobServiceClient(
+                        conn_str="some_connection_string"
+                    ),
                 ):
-                    with patch(
-                        "fence.blueprints.data.indexd.BlobServiceClient.from_connection_string",
-                        return_value=MockBlobServiceClient(
-                            conn_str="some_connection_string"
-                        ),
-                    ):
-                        indexed_file = IndexedFile(file_id="some id")
-                        assert indexed_file.delete_files()
+                    indexed_file = IndexedFile(file_id="some id")
+                    assert indexed_file.delete_files()
 
 
 @pytest.mark.parametrize(
@@ -817,28 +873,25 @@ def test_delete_files_fails_invalid_connection_string(app, public_bucket_indexd_
             """
             raise ValueError("Connection string is either blank or malformed.")
 
-    with patch("fence.blueprints.data.indexd.flask.current_app", return_value=app):
+    with patch("fence.resources.user.user_session.UserSession.create_initial_token"):
         with patch(
-            "fence.resources.user.user_session.UserSession.create_initial_token"
+            "fence.blueprints.data.indexd.flask.current_app.boto.delete_data_file",
+            side_effect=ValueError("Invalid connection string"),
         ):
             with patch(
-                "fence.blueprints.data.indexd.flask.current_app.boto.delete_data_file",
+                "gen3cirrus.GoogleCloudManager.delete_data_file",
                 side_effect=ValueError("Invalid connection string"),
             ):
                 with patch(
-                    "gen3cirrus.GoogleCloudManager.delete_data_file",
-                    side_effect=ValueError("Invalid connection string"),
+                    "fence.blueprints.data.indexd.BlobServiceClient.from_connection_string",
+                    return_value=MockBlobServiceClient(
+                        conn_str="invalid connection string"
+                    ),
                 ):
-                    with patch(
-                        "fence.blueprints.data.indexd.BlobServiceClient.from_connection_string",
-                        return_value=MockBlobServiceClient(
-                            conn_str="invalid connection string"
-                        ),
-                    ):
-                        indexed_file = IndexedFile(file_id="some id")
-                        message, status_code = indexed_file.delete_files()
-                        assert message == "Failed to delete data file."
-                        assert status_code == 500
+                    indexed_file = IndexedFile(file_id="some id")
+                    message, status_code = indexed_file.delete_files()
+                    assert message == "Failed to delete data file."
+                    assert status_code == 500
 
 
 @pytest.mark.parametrize(
@@ -869,13 +922,91 @@ def test_delete_call_not_successful(app, public_bucket_indexd_client):
             """
             return self.data
 
-    with patch("fence.blueprints.data.indexd.flask.current_app", return_value=app):
+    with patch("fence.resources.user.user_session.UserSession.create_initial_token"):
         with patch(
-            "fence.resources.user.user_session.UserSession.create_initial_token"
+            "fence.blueprints.data.indexd.requests.delete",
+            return_value=MockResponse(data=None, status_code=503),
         ):
+            indexed_file = IndexedFile(file_id="some id")
+            assert indexed_file.delete()
+
+
+def test_prepare_bulk_presigned_url_audit_log_combines_authz_and_acl(app):
+    """
+    Test fence.blueprints.data.indexd.prepare_bulk_presigned_url_audit_log populates
+    audit data correctly for bulk file requests.
+    """
+
+    class DummyBulkIndexedFiles:
+        index_document = {
+            "guid1": {
+                "urls": ["s3://bucket/key1"],
+                "authz": ["/programs/DEV/projects/test"],
+            },
+            "guid2": {"urls": ["gs://bucket/key2"], "acl": ["*"]},
+        }
+
+    with app.test_request_context():
+        indexd.flask.g.audit_data = {}
+        indexd.prepare_bulk_presigned_url_audit_log("s3", DummyBulkIndexedFiles())
+
+        assert set(indexd.flask.g.audit_data["resource_paths"]) == {
+            "/programs/DEV/projects/test",
+            "*",
+        }
+        assert indexd.flask.g.audit_data["protocol"] == "s3"
+        assert indexd.flask.g.audit_data["bulk"] is True
+        assert len(indexd.flask.g.audit_data["bulk_files"]) == 2
+        assert {
+            entry["file_id"] for entry in indexd.flask.g.audit_data["bulk_files"]
+        } == {
+            "guid1",
+            "guid2",
+        }
+        assert all(
+            entry["protocol"] == "s3"
+            for entry in indexd.flask.g.audit_data["bulk_files"]
+        )
+
+
+def test_bulk_get_signed_url_for_file_calls_bulk_indexed_files_and_returns_results(
+    app, monkeypatch
+):
+    """
+    Test fence.blueprints.data.indexd.bulk_get_signed_url_for_file delegates to
+    BulkIndexedFiles.get_signed_urls and returns the expected bulk response.
+    """
+
+    monkeypatch.setattr(app, "scoped_session", lambda: MagicMock())
+    expected_urls = ["https://signed1", "https://signed2"]
+    expected_response = {"urls": expected_urls, "failed_guids": []}
+
+    with app.test_request_context(
+        "/?userProject=test-project", headers={"User-Agent": "pytest"}
+    ):
+        with patch(
+            "fence.blueprints.data.indexd.BulkIndexedFiles.index_document",
+            new_callable=mock.PropertyMock,
+        ) as mock_index_document:
+            mock_index_document.return_value = {
+                "guid1": {"urls": ["s3://bucket/key1"], "authz": ["/resource1"]},
+                "guid2": {"urls": ["s3://bucket/key2"], "authz": ["/resource2"]},
+            }
             with patch(
-                "fence.blueprints.data.indexd.requests.delete",
-                return_value=MockResponse(data=None, status_code=503),
-            ):
-                indexed_file = IndexedFile(file_id="some id")
-                assert indexed_file.delete()
+                "fence.blueprints.data.indexd.BulkIndexedFiles.get_signed_urls",
+                return_value=(expected_urls, [None, None], []),
+            ) as mock_get_signed_urls:
+                response = indexd.bulk_get_signed_url_for_file(
+                    ["guid1", "guid2"],
+                    requested_protocol="s3",
+                    r_pays_project="test-project",
+                )
+
+    assert response == expected_response
+    mock_get_signed_urls.assert_called_once_with(
+        "s3",
+        mock.ANY,
+        force_signed_url=True,
+        r_pays_project="test-project",
+        users_from_passports={},
+    )

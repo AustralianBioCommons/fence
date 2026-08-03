@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import os
 import os.path
 import requests
@@ -38,7 +38,7 @@ from fence.jwt.token import (
     generate_signed_refresh_token,
     issued_and_expiration_times,
 )
-from fence.job.visa_update_cronjob import Visa_Token_Update
+from fence.job.access_token_updater import TokenAndAuthUpdater
 from fence.models import (
     Client,
     GoogleServiceAccount,
@@ -245,7 +245,7 @@ def delete_expired_clients_action(DB, slack_webhook=None, warning_days=None):
         warning_days = float(warning_days) if warning_days else 7
         warning_days_in_secs = warning_days * 24 * 60 * 60  # days to seconds
         warning_expiry = (
-            datetime.utcnow() + timedelta(seconds=warning_days_in_secs)
+            datetime.now(UTC) + timedelta(seconds=warning_days_in_secs)
         ).timestamp()
         expiring_clients = (
             current_session.query(Client)
@@ -365,11 +365,6 @@ def _remove_client_service_accounts(db_session, client):
 
 def get_default_init_syncer_inputs(authz_provider):
     DB = os.environ.get("FENCE_DB") or config.get("DB")
-    if DB is None:
-        try:
-            from fence.settings import DB
-        except ImportError:
-            pass
 
     arborist = ArboristClient(
         arborist_base_url=config["ARBORIST"],
@@ -472,6 +467,7 @@ def download_dbgap_files(
     sync_from_local_yaml_file=None,
     arborist=None,
     folder=None,
+    prune_users=True,
 ):
     syncer = init_syncer(
         dbGaP,
@@ -513,7 +509,7 @@ def sync_users(
     )
     if not syncer:
         exit(1)
-    syncer.sync()
+    syncer.sync(prune_users=prune_users)
 
 
 def create_sample_data(DB, yaml_file_path):
@@ -558,9 +554,11 @@ def create_project(s, project_data):
         for storage_access in sa_list:
             provider = storage_access["name"]
             buckets = storage_access.get("buckets", [])
+
             sa = (
                 s.query(StorageAccess)
-                .join(StorageAccess.provider, StorageAccess.project)
+                .join(StorageAccess.provider)
+                .join(StorageAccess.project)
                 .filter(Project.name == project.name)
                 .filter(CloudProvider.name == provider)
                 .first()
@@ -1814,12 +1812,19 @@ def access_token_polling_job(
     thread_pool_size (int): number of Docker container CPU used for jwt verifcation
     buffer_size (int): max size of queue
     """
+    # Instantiating a new client here because the existing
+    # client uses authz_provider
+    arborist = ArboristClient(
+        arborist_base_url=config["ARBORIST"],
+        logger=get_logger("user_syncer.arborist_client"),
+    )
     driver = get_SQLAlchemyDriver(db)
-    job = Visa_Token_Update(
+    job = TokenAndAuthUpdater(
         chunk_size=int(chunk_size) if chunk_size else None,
         concurrency=int(concurrency) if concurrency else None,
         thread_pool_size=int(thread_pool_size) if thread_pool_size else None,
         buffer_size=int(buffer_size) if buffer_size else None,
+        arborist=arborist,
     )
     with driver.session as db_session:
         loop = asyncio.get_event_loop()

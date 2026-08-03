@@ -1,3 +1,12 @@
+# Override the default_digest_method for Signer before flask and flask_wtf are loaded.
+import hashlib
+from itsdangerous import Signer
+
+# Explicitly set to sha256 as the default (sha1) will break in FIPS environments when flask_wtf attempts to process a user registration form.
+# This is a known issue with itsdangerous defaults (see: https://github.com/pgadmin-org/pgadmin4/issues/7979 for a similar issue with pgadmin)
+# According to: https://itsdangerous.palletsprojects.com/en/latest/concepts/#digest-method-security and https://stackoverflow.com/a/27669587, we can override the default here:
+Signer.default_digest_method = hashlib.sha256
+
 from collections import OrderedDict
 import os
 from urllib.parse import urljoin
@@ -18,8 +27,7 @@ from sqlalchemy.orm import scoped_session
 logger = get_logger(__name__, log_level="debug")
 
 # Load the configuration *before* importing modules that rely on it
-from fence.config import config
-from fence.settings import CONFIG_SEARCH_FOLDERS
+from fence.config import config, CONFIG_SEARCH_FOLDERS
 
 config.load(
     config_path=os.environ.get("FENCE_CONFIG_PATH"),
@@ -29,7 +37,6 @@ config.load(
 from fence.auth import logout, build_redirect_url
 from fence.metrics import metrics
 from fence.blueprints.data.indexd import S3IndexedFileLocation
-from fence.blueprints.login.utils import allowed_login_redirects, domain
 from fence.errors import UserError
 from fence.jwt import keys
 from fence.oidc.client import query_client
@@ -48,9 +55,10 @@ from fence.resources.openid.ras_oauth2 import RASOauth2Client
 from fence.resources.storage import StorageManager
 from fence.resources.user.user_session import UserSessionInterface
 from fence.error_handler import get_error_response
-from fence.utils import get_SQLAlchemyDriver
+from fence.utils import get_SQLAlchemyDriver, allowed_login_redirects, domain
 import fence.blueprints.admin
 import fence.blueprints.data
+import fence.blueprints.data.content_blueprint as content_only
 import fence.blueprints.login
 import fence.blueprints.oauth2
 import fence.blueprints.misc
@@ -77,7 +85,6 @@ def warn_about_logger():
 
 def app_init(
     app,
-    settings="fence.settings",
     root_dir=None,
     config_path=None,
     config_file_name=None,
@@ -86,7 +93,6 @@ def app_init(
 
     app_config(
         app,
-        settings=settings,
         root_dir=root_dir,
         config_path=config_path,
         file_name=config_file_name,
@@ -204,7 +210,7 @@ def app_register_blueprints(app):
     @app.route("/metrics")
     def metrics_endpoint():
         """
-        /!\ There is no authz control on this endpoint!
+        WARNING: There is no authz control on this endpoint!
         In cloud-automation setups, access to this endpoint is blocked at the revproxy level.
         """
         data, content_type = metrics.get_latest_metrics()
@@ -333,7 +339,6 @@ def _check_buckets_aws_creds_and_region(app):
 
 def app_config(
     app,
-    settings="fence.settings",
     root_dir=None,
     config_path=None,
     file_name=None,
@@ -344,16 +349,13 @@ def app_config(
     if root_dir is None:
         root_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
-    logger.info("Loading settings...")
-    # not using app.config.from_object because we don't want all the extra flask cfg
-    # vars inside our singleton when we pass these through in the next step
+    # logger.info("Loading settings...")
     settings_cfg = flask.Config(app.config.root_path)
-    settings_cfg.from_object(settings)
 
-    # dump the settings into the config singleton before loading a configuration file
+    # # dump the settings into the config singleton before loading a configuration file
     config.update(dict(settings_cfg))
 
-    # load the configuration file, this overwrites anything from settings/local_settings
+    # load the configuration file
     config.load(
         config_path=config_path,
         search_folders=CONFIG_SEARCH_FOLDERS,
@@ -388,6 +390,9 @@ def _setup_data_endpoint_and_boto(app):
         buckets = config.get("S3_BUCKETS", {})
         app.boto = BotoManager(creds, buckets, logger=logger)
         app.register_blueprint(fence.blueprints.data.blueprint, url_prefix="/data")
+    else:
+        # AWS not configured: only expose /data/content
+        app.register_blueprint(content_only.blueprint, url_prefix="/data")
 
 
 def _load_keys(app, root_dir):
@@ -465,11 +470,16 @@ def _setup_oidc_clients(app):
             # https://docs.authlib.org/en/latest/client/frameworks.html
             app.fence_client.register(**settings)
         else:  # generic OIDC implementation
+            if hasattr(app, "arborist"):
+                app_arborist = app.arborist
+            else:
+                app_arborist = None
             client = Oauth2ClientBase(
                 settings=settings,
                 logger=logger,
                 HTTP_PROXY=config.get("HTTP_PROXY"),
                 idp=settings.get("name") or idp.title(),
+                arborist=app_arborist,
             )
             clean_idp = idp.lower().replace(" ", "")
             setattr(app, f"{clean_idp}_client", client)
@@ -477,7 +487,13 @@ def _setup_oidc_clients(app):
 
 def _setup_arborist_client(app):
     if app.config.get("ARBORIST"):
-        app.arborist = ArboristClient(arborist_base_url=config["ARBORIST"])
+        app.arborist = ArboristClient(
+            arborist_base_url=config["ARBORIST"],
+            timeout=app.config.get("ARBORIST_TIMEOUT", 30),
+        )
+    else:
+        logger.info("Arborist not configured")
+        app.arborist = None
 
 
 def _setup_audit_service_client(app):

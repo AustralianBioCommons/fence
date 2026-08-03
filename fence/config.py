@@ -3,6 +3,7 @@ from yaml import safe_load as yaml_load
 import urllib.parse
 
 import gen3cirrus
+from os.path import expanduser
 from gen3config import Config
 
 from cdislogging import get_logger
@@ -12,6 +13,9 @@ logger = get_logger(__name__)
 DEFAULT_CFG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "config-default.yaml"
 )
+
+# Folders to look in for the *config.yaml for fence
+CONFIG_SEARCH_FOLDERS = ["/var/www/fence", "{}/.gen3/fence".format(expanduser("~"))]
 
 
 class FenceConfig(Config):
@@ -35,13 +39,16 @@ class FenceConfig(Config):
             "GOOGLE_SERVICE_ACCOUNT_KEY_FOR_URL_SIGNING_EXPIRES_IN",
             "GOOGLE_USER_SERVICE_ACCOUNT_ACCESS_EXPIRES_IN",
             "GOOGLE_ACCOUNT_ACCESS_EXPIRES_IN",
-            "ACCESS_TOKEN_EXPIRES_IN",
             "dbGaP",
             "CIRRUS_CFG",
             "WHITE_LISTED_GOOGLE_PARENT_ORGS",
             "CLIENT_CREDENTIALS_ON_DOWNLOAD_ENABLED",
             "DATA_UPLOAD_BUCKET",
             "DEFAULT_BACKOFF_SETTINGS_MAX_TRIES",
+            "ARBORIST_TIMEOUT",
+            "HIDE_IDPS",
+            "GEN3_EMBEDDINGS_API_REGEX",
+            "MAX_BULK_CONTENT_GUIDS_COUNT",
         ]
         for default in defaults:
             self.force_default_if_none(default, default_cfg=default_config)
@@ -140,11 +147,27 @@ class FenceConfig(Config):
             )
 
         for idp_id, idp in self._configs.get("OPENID_CONNECT", {}).items():
+            if not isinstance(idp, dict):
+                raise TypeError(
+                    "Expected 'OPENID_CONNECT' configuration to be a dictionary."
+                )
             mfa_info = idp.get("multifactor_auth_claim_info")
             if mfa_info and mfa_info["claim"] not in ["amr", "acr"]:
                 logger.warning(
                     f"IdP '{idp_id}' is using multifactor_auth_claim_info '{mfa_info['claim']}', which is neither AMR or ACR. Unable to determine if a user used MFA. Fence will continue and assume they have not used MFA."
                 )
+
+            groups_sync_enabled = idp.get("is_authz_groups_sync_enabled", False)
+            # when is_authz_groups_sync_enabled, then you must provide authz_groups_sync, with group prefix
+            if groups_sync_enabled:
+                if not idp.get("authz_groups_sync"):
+                    error = f"Error: is_authz_groups_sync_enabled is enabled, required values not configured, for idp: {idp_id}"
+                    logger.error(error)
+                    raise Exception(error)
+                if not self._configs.get("ARBORIST"):
+                    error = f"Error: is_authz_groups_sync_enabled is enabled for idp '{idp_id}' but ARBORIST url is not configured"
+                    logger.error(error)
+                    raise Exception(error)
 
         self._validate_parent_child_studies(self._configs["dbGaP"])
 

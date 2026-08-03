@@ -1,27 +1,54 @@
-import flask
-from flask import current_app
+import re
+import urllib.request, urllib.parse, urllib.error
 from datetime import datetime
 from functools import wraps
-import urllib.request, urllib.parse, urllib.error
+from json import JSONDecodeError
 
+import backoff
+import flask
+from flask import current_app
 from authutils.errors import JWTError, JWTExpiredError
 from authutils.token.validate import (
     current_token,
-    require_auth_header,
+    require_auth_header as authutils_require_auth_header,
     set_current_token,
     validate_request,
 )
 from cdislogging import get_logger
+import requests
 
+# Note: Iniitalized earlier to avoid circular import errors.
+GEN3_AUDIENCE = "gen3"
+
+
+from fence.authz.auth import check_arborist_auth
+from fence.config import config
 from fence.errors import Unauthorized, InternalError
 from fence.jwt.validate import validate_jwt
 from fence.models import User, IdentityProvider, query_for_user
 from fence.user import get_current_user
-from fence.utils import clear_cookies
-from fence.config import config
-from fence.authz.auth import check_arborist_auth
+from fence.utils import (
+    clear_cookies,
+    DEFAULT_BACKOFF_SETTINGS,
+    allowed_login_redirects,
+    domain,
+)
 
 logger = get_logger(__name__)
+
+
+def require_auth_header(*args, **kwargs):
+    """
+    Injects the default token audience before calling authutils's `require_auth_header`
+    """
+    if "audience" in kwargs:
+        if type(kwargs["audience"]) != list:
+            kwargs["audience"] = [kwargs["audience"]]
+        kwargs["audience"].append(GEN3_AUDIENCE)
+    else:
+        kwargs["audience"] = GEN3_AUDIENCE
+
+    return authutils_require_auth_header(*args, **kwargs)
 
 
 def get_jwt():
@@ -62,61 +89,64 @@ def build_redirect_url(hostname, path):
     return redirect_base + path
 
 
-def login_user(
-    username, provider, fence_idp=None, shib_idp=None, email=None, id_from_idp=None
-):
+def get_ip_information_string():
     """
-    Login a user with the given username and provider. Set values in Flask
-    session to indicate the user being logged in. In addition, commit the user
-    and associated idp information to the db.
+    Returns a string containing the client's IP address and any X-Forwarded headers.
+
+    Returns:
+        str: A formatted string containing the client's IP address and X-Forwarded headers.
+    """
+    x_forwarded_headers = [
+        f"{header}: {value}"
+        for header, value in flask.request.headers
+        if "X-Forwarded" in header
+    ]
+    return f"flask.request.remote_addr={flask.request.remote_addr} x_forwarded_headers={x_forwarded_headers}"
+
+
+def _identify_user_and_update_database(
+    user,
+    username,
+    provider,
+    email=None,
+    id_from_idp=None,
+    username_deny_regex=None,
+) -> bool:
+    """
+    Create a new user if one doesn't already exist in the database. Commit the user
+    and associated idp information to the database.
 
     Args:
+        user (User): user to be logged in, if it already exists, None otherwise
         username (str): specific username of user to be logged in
         provider (str): specfic idp of user to be logged in
-        fence_idp (str, optional): Downstreawm fence IdP
-        shib_idp (str, optional): Downstreawm shibboleth IdP
         email (str, optional): email of user (may or may not match username depending
             on the IdP)
         id_from_idp (str, optional): id from the IDP (which may be different than
             the username)
+
+    Return:
+        User: the created or updated user
     """
+    username_deny_regex = username_deny_regex or config["GLOBAL_USERNAME_DENY_REGEX"]
+    if username_deny_regex:
+        if re.search(pattern=username_deny_regex, string=username):
+            logger.info(
+                f"Blocked login of user with username {username} due to deny regex: {username_deny_regex}"
+            )
 
-    def set_flask_session_values(user):
-        """
-        Helper fuction to set user values in the session.
+            # intentionally empty message to prevent information leakage
+            raise Unauthorized(message="")
 
-        Args:
-            user (User): User object
-        """
-        flask.session["username"] = user.username
-        flask.session["user_id"] = str(user.id)
-        flask.session["provider"] = user.identity_provider.name
-        if fence_idp:
-            flask.session["fence_idp"] = fence_idp
-        if shib_idp:
-            flask.session["shib_idp"] = shib_idp
-        flask.g.user = user
-        flask.g.scopes = ["_all"]
-        flask.g.token = None
-
-    user = query_for_user(session=current_app.scoped_session(), username=username)
     if user:
         if user.active == False:
             # Abort login if user.active == False:
             raise Unauthorized(
                 "User is known but not authorized/activated in the system"
             )
-
         _update_users_email(user, email)
         _update_users_id_from_idp(user, id_from_idp)
         _update_users_last_auth(user)
-
-        #  This expression is relevant to those users who already have user and
-        #  idp info persisted to the database. We return early to avoid
-        #  unnecessarily re-saving that user and idp info.
-        if user.identity_provider and user.identity_provider.name == provider:
-            set_flask_session_values(user)
-            return
     else:
         if not config["ALLOW_NEW_USER_ON_LOGIN"]:
             # do not create new active users automatically
@@ -132,21 +162,121 @@ def login_user(
             user.id_from_idp = id_from_idp
             # TODO: update iss_sub mapping table?
 
-    # setup idp connection for new user (or existing user w/o it setup)
-    idp = (
-        current_app.scoped_session()
-        .query(IdentityProvider)
-        .filter(IdentityProvider.name == provider)
-        .first()
+    # This expression is relevant to those users who already have user and
+    # idp info persisted to the database. We avoid unnecessarily re-saving
+    # that user and idp info.
+    if not user.identity_provider or not user.identity_provider.name == provider:
+        # setup idp connection for new user (or existing user w/o it setup)
+        idp = (
+            current_app.scoped_session()
+            .query(IdentityProvider)
+            .filter(IdentityProvider.name == provider)
+            .first()
+        )
+        if not idp:
+            idp = IdentityProvider(name=provider)
+
+        user.identity_provider = idp
+        current_app.scoped_session().add(user)
+        current_app.scoped_session().commit()
+
+    # `login_in_progress_username` stored for use by the user registration code.
+    # not using `flask.session["username"]` because other code relies on it to know
+    # whether a user is logged in; in this case the user isn't logged in yet.
+    flask.session["login_in_progress_username"] = user.username
+
+    flask.g.user = user
+    return user
+
+
+def _is_user_registration_required_before_login(user, provider) -> bool:
+    auto_registration_enabled = (
+        config["OPENID_CONNECT"]
+        .get(provider, {})
+        .get("enable_idp_users_registration", False)
     )
-    if not idp:
-        idp = IdentityProvider(name=provider)
+    # Registration is required if:
+    # - Registration is enabled in the config, AND
+    # - Automatic registration is NOT enabled, AND
+    # - The user's registration info is empty
+    return (
+        config["REGISTER_USERS_ON"]
+        and not auto_registration_enabled
+        and user.additional_info.get("registration_info", {}) == {}
+    )
 
-    user.identity_provider = idp
-    current_app.scoped_session().add(user)
-    current_app.scoped_session().commit()
 
-    set_flask_session_values(user)
+def login_user_or_require_registration(
+    username, provider, upstream_idp=None, shib_idp=None, email=None, id_from_idp=None
+) -> bool:
+    """
+    Check if a user needs to go through the registration flow before being logged in. If not,
+    login the user with the given username and provider. Set values in Flask session to indicate
+    the user being logged in.
+
+    Args:
+        username (str): specific username of user to be logged in
+        provider (str): specfic idp of user to be logged in
+        upstream_idp (str, optional): upstream fence IdP
+        shib_idp (str, optional): upstream shibboleth IdP
+        email (str, optional): email of user (may or may not match username depending
+            on the IdP)
+        id_from_idp (str, optional): id from the IDP (which may be different than
+            the username)
+
+    Return:
+        bool: whether the user has been logged in (if registration is enabled and the user is not
+            registered, this would be False)
+    """
+
+    def log_ip(user):
+        ip_info = get_ip_information_string()
+        logger.info(
+            f"User logged in. user.id={user.id} user.username={user.username} {ip_info}"
+        )
+
+    def set_flask_session_values(user):
+        """
+        Helper fuction to set user values in the session.
+
+        Args:
+            user (User): User object
+        """
+        flask.session["username"] = user.username
+        flask.session["user_id"] = str(user.id)
+        flask.session["provider"] = user.identity_provider.name
+        if upstream_idp:
+            flask.session["upstream_idp"] = upstream_idp
+        if shib_idp:
+            flask.session["shib_idp"] = shib_idp
+        flask.g.user = user
+        flask.g.scopes = ["_all"]
+        flask.g.token = None
+
+    user = query_for_user(session=current_app.scoped_session(), username=username)
+    user = _identify_user_and_update_database(
+        user, username, provider, email, id_from_idp
+    )
+    log_user_in = not _is_user_registration_required_before_login(user, provider)
+    if log_user_in:
+        set_flask_session_values(user)
+        log_ip(user)
+    return log_user_in
+
+
+@backoff.on_exception(backoff.expo, Exception, **DEFAULT_BACKOFF_SETTINGS)
+def get_openid_config_for_idp(open_id_connect):
+    """
+    Return openid configuration for a given provider.
+    Args:
+        open_id_connect (dict): fence config for idp
+    Returns:
+        response: response of openid configuration
+    """
+    well_known_url = open_id_connect["discovery_url"]
+    well_known_resp = requests.get(well_known_url)
+    well_known_resp.raise_for_status()
+    return well_known_resp
 
 
 def logout(next_url, force_era_global_logout=False):
@@ -162,17 +292,66 @@ def logout(next_url, force_era_global_logout=False):
     # propogate logout to IDP
     provider_logout = None
     provider = flask.session.get("provider")
+
     if force_era_global_logout or provider == IdentityProvider.itrust:
         safe_url = urllib.parse.quote_plus(next_url)
         provider_logout = config["ITRUST_GLOBAL_LOGOUT"] + safe_url
     elif provider == IdentityProvider.fence:
         base = config["OPENID_CONNECT"]["fence"]["api_base_url"]
         provider_logout = base + "/logout?" + urllib.parse.urlencode({"next": next_url})
+    elif provider == "cognito":
+        idp_openid_connect = config["OPENID_CONNECT"]["cognito"]
+        well_known = None
+        try:
+            well_known_resp = get_openid_config_for_idp(idp_openid_connect)
+            well_known = well_known_resp.json()
+        except requests.exceptions.HTTPError as e:
+            logger.error(
+                f"Well-known endpoint returned an error status after multiple retries, Cognito Session not invalidated, Logging out of Gen3. Error: {e}"
+            )
+        except requests.exceptions.ConnectionError as e:
+            logger.error(
+                f"Could not connect to well-known endpoint, Cognito Session not invalidated, Logging out of Gen3. Error: {e} "
+            )
+        except JSONDecodeError as e:
+            logger.error(
+                f"Invalid JSON resonse from well-known, Cognito Session not invalidated, Logging out of Gen3. Error: {e}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Error occured trying to get well-known, Cognito Session not invalidated, Logging out from Gen3. Error: {e}"
+            )
+        if well_known:
+            end_session_endpoint = well_known.get("end_session_endpoint")
+            # NOTE: discovery url for cognito is different than the cognito api domain url. Check the domain for the APIs like end_session_endpoint or authorization_endpoint found in the well-know openid config
+            if domain(end_session_endpoint) not in allowed_login_redirects():
+                logger.error(
+                    f"Logout url {end_session_endpoint} not in LOGIN_REDIRECT_WHITELIST config. Cognito Session not invalidated, Logging out from Gen3."
+                )
+            else:
+                if end_session_endpoint:
+                    provider_logout = (
+                        end_session_endpoint
+                        + "?"
+                        + urllib.parse.urlencode(
+                            {
+                                "client_id": idp_openid_connect["client_id"],
+                                "logout_uri": next_url,  # NOTE: This needs to be set up in the cognito console for an allowed sign-out url
+                            }
+                        )
+                    )
+                else:
+                    logger.error(
+                        "end_session_endpoint not found in well-known config. Cognito Session not invalidated. Logging out from Gen3"
+                    )
 
     flask.session.clear()
-    redirect_response = flask.make_response(
-        flask.redirect(provider_logout or urllib.parse.unquote(next_url))
-    )
+    try:
+        redirect_response = flask.make_response(
+            flask.redirect(provider_logout or urllib.parse.unquote(next_url))
+        )
+    except Exception as e:
+        logger.error(f"Error logging out: {e}")
     clear_cookies(redirect_response)
     return redirect_response
 
@@ -202,7 +381,11 @@ def login_required(scope=None):
         @wraps(f)
         def wrapper(*args, **kwargs):
             if flask.session.get("username"):
-                login_user(flask.session["username"], flask.session["provider"])
+                is_logged_in = login_user_or_require_registration(
+                    flask.session["username"], flask.session["provider"]
+                )
+                if not is_logged_in:
+                    raise Unauthorized("Please register to login")
                 return f(*args, **kwargs)
 
             eppn = None
@@ -231,7 +414,11 @@ def login_required(scope=None):
                 username = eppn.split("!")[-1]
                 flask.session["username"] = username
                 flask.session["provider"] = IdentityProvider.itrust
-                login_user(username, flask.session["provider"])
+                is_logged_in = login_user_or_require_registration(
+                    username, flask.session["provider"]
+                )
+                if not is_logged_in:
+                    raise Unauthorized("Please register to login")
                 return f(*args, **kwargs)
             else:
                 raise Unauthorized("Please login")

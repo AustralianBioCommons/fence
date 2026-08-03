@@ -7,7 +7,7 @@ from random import SystemRandom
 import re
 import string
 import requests
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 import sys
 
@@ -32,6 +32,27 @@ def random_str(length):
 
 def json_res(data):
     return flask.Response(json.dumps(data), mimetype="application/json")
+
+
+def fetch_url_data(url: str, format: str, expected_status_code: int = 200) -> str:
+    """
+    Perform a GET request and return the raw response data.
+    Using this function instead of making the request directly in the caller function allows us
+    to mock the returned data in unit tests.
+
+    Args:
+        url (str): URL to GET
+
+    Returns:
+        str: raw response data
+    """
+    res = requests.get(url)
+    assert res.status_code == expected_status_code, f"Unable to fetch data from '{url}'"
+    if format == "text":
+        return res.text
+    elif format == "json":
+        return res.json()
+    raise Exception(f"Unknown 'fetch_url_data' format '{format}'")
 
 
 def generate_client_credentials(confidential):
@@ -453,3 +474,53 @@ def validate_scopes(request_scopes, client):
             raise InvalidScopeError("Failed to Authorize due to unsupported scope")
 
     return True
+
+
+def strtobool(val: str) -> bool:
+    """Convert a string representation of truth to true (1) or false (0).
+
+    True values are 'y', 'yes', 't', 'true', 'on', and '1'; false values
+    are 'n', 'no', 'f', 'false', 'off', and '0'.  Raises ValueError if
+    'val' is anything else.
+    """
+    val = val.lower()
+    if val in ("y", "yes", "t", "true", "on", "1"):
+        return True
+    elif val in ("n", "no", "f", "false", "off", "0"):
+        return False
+    else:
+        raise ValueError(f"invalid truth value {val!r}")
+
+
+def allowed_login_redirects():
+    """
+    Determine which redirects a login redirect endpoint (``/login/google``, etc) should
+    be allowed to redirect back to after login. By default this includes the base URL
+    from this flask application, and also includes the redirect URLs registered for any
+    OAuth clients.
+
+    Return:
+        List[str]: allowed redirect URLs
+    """
+    allowed = config.get("LOGIN_REDIRECT_WHITELIST", [])
+    allowed.append(config["BASE_URL"])
+    with flask.current_app.db.session as session:
+        clients = session.query(Client).all()
+        for client in clients:
+            if isinstance(client.redirect_uris, list):
+                allowed.extend(client.redirect_uris)
+            elif isinstance(client.redirect_uris, str):
+                allowed.append(client.redirect_uris)
+    return {domain(url) for url in allowed}
+
+
+def domain(url):
+    """
+    Return just the domain for a URL, no schema or path etc. This is to consistently
+    compare different URLs from flask, the config, and from the user.
+    """
+    if not url:
+        return ""
+    if url.startswith("/"):
+        return urlparse(config["BASE_URL"]).netloc
+    return urlparse(url).netloc

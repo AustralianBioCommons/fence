@@ -3,6 +3,7 @@ import time
 import urllib.parse
 import uuid
 
+from fence.auth import GEN3_AUDIENCE
 from flask import current_app
 
 from fence.config import config
@@ -111,7 +112,7 @@ def create_awg_user(users, db_session):
                 grp.description = group_desc
                 s.add(grp)
                 s.flush()
-            UserToGroup(group=grp, user=user)
+            s.add(UserToGroup(group=grp, user=user))
             for projectname in group["projects"]:
                 gap = (
                     s.query(AccessPrivilege)
@@ -257,13 +258,13 @@ def default_claims():
     iat, exp = iat_and_exp()
     return {
         "pur": "access",
-        "aud": [iss],
+        "aud": [GEN3_AUDIENCE],
         "sub": "1234",
         "iss": iss,
         "iat": iat,
         "exp": exp,
         "jti": jti,
-        "azp": "",
+        "azp": "test-client",
         "scope": ["openid", "user"],
         "context": {
             "user": {
@@ -286,14 +287,14 @@ def unauthorized_context_claims(user_name, user_id):
     jti = new_jti()
     iat, exp = iat_and_exp()
     return {
-        "aud": [iss],
+        "aud": [GEN3_AUDIENCE],
         "sub": str(user_id),
         "pur": "access",
         "iss": iss,
         "iat": iat,
         "exp": exp,
         "jti": jti,
-        "azp": "",
+        "azp": "test-client",
         "scope": ["access", "data", "user", "openid"],
         "context": {
             "user": {
@@ -319,13 +320,13 @@ def authorized_download_context_claims(user_name, user_id):
     jti = new_jti()
     iat, exp = iat_and_exp()
     return {
-        "aud": [iss],
+        "aud": [GEN3_AUDIENCE],
         "sub": str(user_id),
         "iss": iss,
         "iat": iat,
         "exp": exp,
         "jti": jti,
-        "azp": "",
+        "azp": "test-client",
         "pur": "access",
         "scope": ["access", "data", "user", "openid"],
         "context": {
@@ -352,7 +353,7 @@ def authorized_service_account_management_claims(user_name, user_id, client_id):
     jti = new_jti()
     iat, exp = iat_and_exp()
     return {
-        "aud": [iss],
+        "aud": [GEN3_AUDIENCE],
         "sub": str(user_id),
         "iss": iss,
         "iat": iat,
@@ -402,7 +403,7 @@ def authorized_download_credentials_context_claims(
     jti = new_jti()
     iat, exp = iat_and_exp()
     return {
-        "aud": [iss],
+        "aud": [GEN3_AUDIENCE],
         "sub": str(user_id),
         "iss": iss,
         "iat": iat,
@@ -435,7 +436,7 @@ def authorized_upload_context_claims(user_name, user_id):
     jti = new_jti()
     iat, exp = iat_and_exp()
     return {
-        "aud": [iss],
+        "aud": [GEN3_AUDIENCE],
         "sub": str(user_id),
         "iss": iss,
         "pur": "access",
@@ -470,7 +471,7 @@ def client_authorized_download_context_claims():
     jti = new_jti()
     iat, exp = iat_and_exp()
     return {
-        "aud": [iss],
+        "aud": [GEN3_AUDIENCE],
         "iss": iss,
         "iat": iat,
         "exp": exp,
