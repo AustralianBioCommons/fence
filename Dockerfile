@@ -40,6 +40,7 @@ RUN poetry install --without dev --no-interaction
 RUN git config --global --add safe.directory ${appname} && COMMIT=`git rev-parse HEAD` && echo "COMMIT=\"${COMMIT}\"" > $appname/version_data.py \
     && VERSION=`git describe --always --tags` && echo "VERSION=\"${VERSION}\"" >> $appname/version_data.py
 
+RUN echo "COMMIT=\"$COMMIT_HASH\"" > /fence/version_data.py
 
 
 # ------ Final stage ------
